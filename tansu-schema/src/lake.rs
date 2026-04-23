@@ -136,11 +136,32 @@ pub trait LakeHouse: Clone + Debug + Send + Sync + 'static {
     /// Store a batch of records in this lake house
     async fn store(&self, write: LakeWriteRequest<'_>) -> Result<()>;
 
+    /// Stage a transactional batch for later commit/abort finalization.
+    async fn stage_transactional(&self, request: StageTransactionalRequest<'_>) -> Result<()> {
+        let StageTransactionalRequest { transaction, write } = request;
+
+        let _ = transaction;
+        self.store(write).await
+    }
+
+    /// Finalize all staged transactional batches for the given transaction.
+    async fn finalize_transaction(&self, request: FinalizeTransactionRequest<'_>) -> Result<()> {
+        let _ = request;
+        Ok(())
+    }
+
     /// Run periodic maintenance on this lake house
     async fn maintain(&self) -> Result<()>;
 
     /// Query the underlying type of this lake house
     async fn lake_type(&self) -> Result<LakeHouseType>;
+}
+
+#[derive(Debug)]
+pub struct TransactionRef<'a> {
+    pub transaction_id: &'a str,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
 }
 
 #[derive(Debug)]
@@ -150,6 +171,18 @@ pub struct LakeWriteRequest<'a> {
     pub offset: i64,
     pub inflated: &'a Batch,
     pub config: DescribeConfigsResult,
+}
+
+#[derive(Debug)]
+pub struct StageTransactionalRequest<'a> {
+    pub transaction: TransactionRef<'a>,
+    pub write: LakeWriteRequest<'a>,
+}
+
+#[derive(Debug)]
+pub struct FinalizeTransactionRequest<'a> {
+    pub transaction: TransactionRef<'a>,
+    pub committed: bool,
 }
 
 #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
@@ -236,6 +269,42 @@ impl LakeHouse for House {
     #[instrument(skip(self), ret)]
     async fn lake_type(&self) -> Result<LakeHouseType> {
         Ok(LakeHouseType::from(self))
+    }
+
+    #[instrument(skip(self, request), ret)]
+    async fn stage_transactional(&self, request: StageTransactionalRequest<'_>) -> Result<()> {
+        let _ = &request;
+
+        match self {
+            #[cfg(feature = "delta")]
+            House::Delta(inner) => inner.stage_transactional(request).await,
+
+            #[cfg(feature = "iceberg")]
+            House::Iceberg(inner) => inner.stage_transactional(request).await,
+
+            #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+            House::Parquet(inner) => inner.stage_transactional(request).await,
+
+            House::None => Ok(()),
+        }
+    }
+
+    #[instrument(skip(self), ret)]
+    async fn finalize_transaction(&self, request: FinalizeTransactionRequest<'_>) -> Result<()> {
+        let _ = &request;
+
+        match self {
+            #[cfg(feature = "delta")]
+            House::Delta(inner) => inner.finalize_transaction(request).await,
+
+            #[cfg(feature = "iceberg")]
+            House::Iceberg(inner) => inner.finalize_transaction(request).await,
+
+            #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+            House::Parquet(inner) => inner.finalize_transaction(request).await,
+
+            House::None => Ok(()),
+        }
     }
 }
 
