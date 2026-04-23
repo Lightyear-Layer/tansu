@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env::vars,
     marker::PhantomData,
     sync::{Arc, Mutex},
@@ -21,7 +21,10 @@ use std::{
 
 use crate::{
     AsArrow as _, Error, Registry, Result,
-    lake::{LakeHouse, LakeHouseType, LakeWriteRequest},
+    lake::{
+        FinalizeTransactionRequest, LakeHouse, LakeHouseType, LakeWriteRequest,
+        StageTransactionalRequest,
+    },
 };
 use async_trait::async_trait;
 use iceberg::memory::MemoryCatalogBuilder;
@@ -126,11 +129,37 @@ pub struct Iceberg {
     catalog: Arc<dyn Catalog>,
     namespace: String,
     tables: Arc<Mutex<HashMap<String, Table>>>,
+    staged_writes: Arc<Mutex<BTreeMap<TxnKey, Vec<PendingWrite>>>>,
     schema_registry: Registry,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct TxnKey {
+    transaction_id: String,
+    producer_id: i64,
+    producer_epoch: i16,
+}
+
+impl TxnKey {
+    fn new(transaction_id: &str, producer_id: i64, producer_epoch: i16) -> Self {
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            producer_id,
+            producer_epoch,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingWrite {
+    topic: String,
+    partition: i32,
+    offset: i64,
+    batch: Batch,
+}
+
 #[derive(Clone, Copy, Debug)]
-pub struct TransactionWrite<'a> {
+pub(crate) struct TransactionWrite<'a> {
     pub partition: i32,
     pub offset: i64,
     pub batch: &'a Batch,
@@ -143,6 +172,7 @@ impl Iceberg {
             catalog,
             namespace: value.namespace.unwrap_or(String::from("tansu")),
             tables: Arc::new(Mutex::new(HashMap::new())),
+            staged_writes: Arc::new(Mutex::new(BTreeMap::new())),
             schema_registry: value.schema_registry,
         })
     }
@@ -270,7 +300,7 @@ impl Iceberg {
         Ok(table)
     }
 
-    pub async fn store_transaction(
+    pub(crate) async fn store_transaction(
         &self,
         topic: &str,
         writes: &[TransactionWrite<'_>],
@@ -285,6 +315,7 @@ impl Iceberg {
             .schema_registry
             .as_arrow(topic, first.partition, first.batch, LakeHouseType::Iceberg)
             .await?;
+        let first_schema = first_record_batch.schema();
 
         debug!(?first_record_batch);
         debug!(schema = ?first_record_batch.schema());
@@ -342,6 +373,13 @@ impl Iceberg {
                 .schema_registry
                 .as_arrow(topic, write.partition, write.batch, LakeHouseType::Iceberg)
                 .await?;
+
+            if record_batch.schema() != first_schema {
+                return Err(Error::Message(format!(
+                    "schema mismatch in transactional write for topic={topic}, partition={}, offset={}",
+                    write.partition, write.offset
+                )));
+            }
 
             data_file_writer
                 .write(record_batch)
@@ -404,11 +442,98 @@ impl LakeHouse for Iceberg {
     async fn lake_type(&self) -> Result<LakeHouseType> {
         Ok(LakeHouseType::Iceberg)
     }
+
+    async fn stage_transactional(&self, request: StageTransactionalRequest<'_>) -> Result<()> {
+        let StageTransactionalRequest { transaction, write } = request;
+
+        let LakeWriteRequest {
+            topic,
+            partition,
+            offset,
+            inflated,
+            config: _config,
+        } = write;
+
+        let mut staged = self.staged_writes.lock().map_err(|err| {
+            Error::Message(format!("unable to lock iceberg staged writes: {err}"))
+        })?;
+
+        staged
+            .entry(TxnKey::new(
+                transaction.transaction_id,
+                transaction.producer_id,
+                transaction.producer_epoch,
+            ))
+            .or_default()
+            .push(PendingWrite {
+                topic: topic.to_owned(),
+                partition,
+                offset,
+                batch: inflated.clone(),
+            });
+
+        Ok(())
+    }
+
+    async fn finalize_transaction(&self, request: FinalizeTransactionRequest<'_>) -> Result<()> {
+        let key = TxnKey::new(
+            request.transaction.transaction_id,
+            request.transaction.producer_id,
+            request.transaction.producer_epoch,
+        );
+
+        let writes = self
+            .staged_writes
+            .lock()
+            .map_err(|err| Error::Message(format!("unable to lock iceberg staged writes: {err}")))?
+            .remove(&key);
+
+        if !request.committed {
+            return Ok(());
+        }
+
+        let Some(mut writes) = writes else {
+            return Err(Error::Message(format!(
+                "missing staged iceberg writes for committed transaction: id={}, producer_id={}, producer_epoch={}",
+                request.transaction.transaction_id,
+                request.transaction.producer_id,
+                request.transaction.producer_epoch
+            )));
+        };
+
+        writes.sort_by(|lhs, rhs| {
+            lhs.topic
+                .cmp(&rhs.topic)
+                .then(lhs.partition.cmp(&rhs.partition))
+                .then(lhs.offset.cmp(&rhs.offset))
+        });
+
+        let mut by_topic: BTreeMap<String, Vec<TransactionWrite<'_>>> = BTreeMap::new();
+
+        for write in &writes {
+            by_topic
+                .entry(write.topic.clone())
+                .or_default()
+                .push(TransactionWrite {
+                    partition: write.partition,
+                    offset: write.offset,
+                    batch: &write.batch,
+                });
+        }
+
+        for (topic, transaction_writes) in by_topic {
+            self.store_transaction(topic.as_str(), &transaction_writes)
+                .await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lake::TransactionRef;
     use dotenv::dotenv;
     use iceberg::spec::{NestedField, PrimitiveType, Type};
     use rand::{distr::Alphanumeric, prelude::*, rng};
@@ -446,6 +571,73 @@ mod tests {
                 )
                 .finish(),
         ))
+    }
+
+    async fn memory_iceberg(namespace: String) -> Result<Iceberg> {
+        let schema_registry = Registry::from_str("memory://")?;
+
+        Iceberg::new(
+            Builder::<PhantomData<Url>, PhantomData<Url>, PhantomData<Registry>>::default()
+                .location(Url::parse("memory://")?)
+                .catalog(Url::parse("memory://")?)
+                .schema_registry(schema_registry)
+                .namespace(Some(namespace)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn finalize_committed_requires_staged_writes() -> Result<()> {
+        let lake = memory_iceberg(alphanumeric_string(8)).await?;
+
+        let result = lake
+            .finalize_transaction(FinalizeTransactionRequest {
+                transaction: TransactionRef {
+                    transaction_id: "txn-missing",
+                    producer_id: 1,
+                    producer_epoch: 0,
+                },
+                committed: true,
+            })
+            .await;
+
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_abort_clears_staged_state() -> Result<()> {
+        let lake = memory_iceberg(alphanumeric_string(8)).await?;
+        let tx_key = TxnKey::new("txn-abort", 2, 0);
+
+        {
+            let mut guard = lake.staged_writes.lock()?;
+            _ = guard.insert(
+                tx_key.clone(),
+                vec![PendingWrite {
+                    topic: "topic-a".to_owned(),
+                    partition: 0,
+                    offset: 0,
+                    batch: Batch::default(),
+                }],
+            );
+        }
+
+        lake.finalize_transaction(FinalizeTransactionRequest {
+            transaction: TransactionRef {
+                transaction_id: "txn-abort",
+                producer_id: 2,
+                producer_epoch: 0,
+            },
+            committed: false,
+        })
+        .await?;
+
+        let guard = lake.staged_writes.lock()?;
+        assert!(!guard.contains_key(&tx_key));
+
+        Ok(())
     }
 
     #[tokio::test]
