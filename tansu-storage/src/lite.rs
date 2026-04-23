@@ -74,7 +74,7 @@ use tansu_sans_io::{
 };
 use tansu_schema::{
     Registry,
-    lake::{House, LakeHouse as _},
+    lake::{House, LakeHouse as _, LakeWriteRequest},
 };
 use tokio::{fs::rename, sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -869,13 +869,13 @@ impl Delegate {
                 .await
                 .inspect_err(|err| error!(?err))?;
 
-            lake.store(
-                topition.topic(),
-                topition.partition(),
-                high.unwrap_or_default(),
-                &inflated,
+            lake.store(LakeWriteRequest {
+                topic: topition.topic(),
+                partition: topition.partition(),
+                offset: high.unwrap_or_default(),
+                inflated: &inflated,
                 config,
-            )
+            })
             .await
             .inspect_err(|err| error!(?err))?;
         }

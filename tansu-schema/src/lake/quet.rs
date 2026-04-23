@@ -23,13 +23,12 @@ use object_store::{
     path::Path,
 };
 use parquet::arrow::AsyncArrowWriter;
-use tansu_sans_io::{describe_configs_response::DescribeConfigsResult, record::inflated::Batch};
 use tracing::debug;
 use url::Url;
 
 use crate::{
     AsArrow as _, Error, Registry, Result,
-    lake::{LakeHouse, LakeHouseType},
+    lake::{LakeHouse, LakeHouseType, LakeWriteRequest},
 };
 
 use super::House;
@@ -70,14 +69,15 @@ pub struct Parquet {
 
 #[async_trait]
 impl LakeHouse for Parquet {
-    async fn store(
-        &self,
-        topic: &str,
-        partition: i32,
-        offset: i64,
-        inflated: &Batch,
-        _config: DescribeConfigsResult,
-    ) -> Result<()> {
+    async fn store(&self, write: LakeWriteRequest<'_>) -> Result<()> {
+        let LakeWriteRequest {
+            topic,
+            partition,
+            offset,
+            inflated,
+            config: _config,
+        } = write;
+
         let record_batch = self
             .schema_registry
             .as_arrow(topic, partition, inflated, LakeHouseType::Parquet)

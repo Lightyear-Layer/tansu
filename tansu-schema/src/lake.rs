@@ -134,20 +134,22 @@ impl LakeHouseType {
 #[async_trait]
 pub trait LakeHouse: Clone + Debug + Send + Sync + 'static {
     /// Store a batch of records in this lake house
-    async fn store(
-        &self,
-        topic: &str,
-        partition: i32,
-        offset: i64,
-        inflated: &Batch,
-        config: DescribeConfigsResult,
-    ) -> Result<()>;
+    async fn store(&self, write: LakeWriteRequest<'_>) -> Result<()>;
 
     /// Run periodic maintenance on this lake house
     async fn maintain(&self) -> Result<()>;
 
     /// Query the underlying type of this lake house
     async fn lake_type(&self) -> Result<LakeHouseType>;
+}
+
+#[derive(Debug)]
+pub struct LakeWriteRequest<'a> {
+    pub topic: &'a str,
+    pub partition: i32,
+    pub offset: i64,
+    pub inflated: &'a Batch,
+    pub config: DescribeConfigsResult,
 }
 
 #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
@@ -177,40 +179,21 @@ static MAINTENANCE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
 
 #[async_trait]
 impl LakeHouse for House {
-    #[instrument(skip(self, inflated), ret)]
-    async fn store(
-        &self,
-        topic: &str,
-        partition: i32,
-        offset: i64,
-        inflated: &Batch,
-        configs: DescribeConfigsResult,
-    ) -> Result<()> {
-        let _ = (topic, partition, offset, inflated, configs.clone());
+    #[instrument(skip(self, write), ret)]
+    async fn store(&self, write: LakeWriteRequest<'_>) -> Result<()> {
+        let topic = write.topic.to_owned();
 
         let start = SystemTime::now();
 
         match self {
             #[cfg(feature = "delta")]
-            House::Delta(inner) => {
-                inner
-                    .store(topic, partition, offset, inflated, configs)
-                    .await
-            }
+            House::Delta(inner) => inner.store(write).await,
 
             #[cfg(feature = "iceberg")]
-            House::Iceberg(inner) => {
-                inner
-                    .store(topic, partition, offset, inflated, configs)
-                    .await
-            }
+            House::Iceberg(inner) => inner.store(write).await,
 
             #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
-            House::Parquet(inner) => {
-                inner
-                    .store(topic, partition, offset, inflated, configs)
-                    .await
-            }
+            House::Parquet(inner) => inner.store(write).await,
 
             House::None => Ok(()),
         }
@@ -219,7 +202,7 @@ impl LakeHouse for House {
                 start
                     .elapsed()
                     .map_or(0, |duration| duration.as_millis() as u64),
-                &[KeyValue::new("topic", topic.to_owned())],
+                &[KeyValue::new("topic", topic.clone())],
             )
         })
     }

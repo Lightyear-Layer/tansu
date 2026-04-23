@@ -65,7 +65,7 @@ use tansu_sans_io::{
 };
 use tansu_schema::{
     Registry,
-    lake::{House, LakeHouse as _},
+    lake::{House, LakeHouse as _, LakeWriteRequest},
 };
 use tracing::{debug, error};
 use turso::{
@@ -612,13 +612,13 @@ impl Engine {
                 .describe_config(topition.topic(), ConfigResource::Topic, None)
                 .await?;
 
-            lake.store(
-                topition.topic(),
-                topition.partition(),
-                high.unwrap_or_default(),
-                &inflated,
+            lake.store(LakeWriteRequest {
+                topic: topition.topic(),
+                partition: topition.partition(),
+                offset: high.unwrap_or_default(),
+                inflated: &inflated,
                 config,
-            )
+            })
             .await
             .inspect(|store| debug!(?store))
             .inspect_err(|err| debug!(?err))?;

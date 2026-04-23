@@ -65,7 +65,7 @@ use tansu_sans_io::{
 };
 use tansu_schema::{
     Registry,
-    lake::{House, LakeHouse as _},
+    lake::{House, LakeHouse as _, LakeWriteRequest},
 };
 use tracing::{debug, error, instrument, warn};
 use url::Url;
@@ -782,13 +782,13 @@ impl Storage for DynoStore {
                         .inspect_err(|err| debug!(?err))?;
 
                     if let Some(ref lake) = self.lake {
-                        lake.store(
-                            topition.topic(),
-                            topition.partition(),
+                        lake.store(LakeWriteRequest {
+                            topic: topition.topic(),
+                            partition: topition.partition(),
                             offset,
-                            &inflated,
+                            inflated: &inflated,
                             config,
-                        )
+                        })
                         .await
                         .inspect(|store| debug!(?store))
                         .inspect_err(|err| debug!(?err))?;
@@ -901,13 +901,13 @@ impl Storage for DynoStore {
                 let inflated =
                     inflated::Batch::try_from(&deflated).inspect_err(|err| debug!(?err))?;
 
-                lake.store(
-                    topition.topic(),
-                    topition.partition(),
+                lake.store(LakeWriteRequest {
+                    topic: topition.topic(),
+                    partition: topition.partition(),
                     offset,
-                    &inflated,
+                    inflated: &inflated,
                     config,
-                )
+                })
                 .await
                 .inspect(|store| debug!(?store))
                 .inspect_err(|err| debug!(?err))?;

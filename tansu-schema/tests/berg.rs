@@ -34,7 +34,7 @@ use tansu_sans_io::{
 };
 use tansu_schema::{
     Registry, Result,
-    lake::{House, LakeHouse, berg::env_s3_props},
+    lake::{House, LakeHouse, LakeWriteRequest, berg::env_s3_props},
 };
 use tracing::debug;
 use url::Url;
@@ -67,7 +67,13 @@ pub async fn lake_store(
     let offset = 543212345;
 
     lake_house
-        .store(topic, partition, offset, inflated, config)
+        .store(LakeWriteRequest {
+            topic,
+            partition,
+            offset,
+            inflated,
+            config,
+        })
         .await
         .inspect(|result| debug!(?result))
         .inspect_err(|err| debug!(?err))?;

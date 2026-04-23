@@ -21,7 +21,7 @@ use std::{
 
 use crate::{
     AsArrow as _, Error, Registry, Result,
-    lake::{LakeHouse, LakeHouseType},
+    lake::{LakeHouse, LakeHouseType, LakeWriteRequest},
 };
 use async_trait::async_trait;
 use iceberg::memory::MemoryCatalogBuilder;
@@ -45,7 +45,7 @@ use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
 };
 use parquet::file::properties::WriterProperties;
-use tansu_sans_io::{describe_configs_response::DescribeConfigsResult, record::inflated::Batch};
+use tansu_sans_io::record::inflated::Batch;
 use tracing::{debug, error};
 use url::Url;
 use uuid::Uuid;
@@ -127,6 +127,13 @@ pub struct Iceberg {
     namespace: String,
     tables: Arc<Mutex<HashMap<String, Table>>>,
     schema_registry: Registry,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TransactionWrite<'a> {
+    pub partition: i32,
+    pub offset: i64,
+    pub batch: &'a Batch,
 }
 
 impl Iceberg {
@@ -262,30 +269,27 @@ impl Iceberg {
 
         Ok(table)
     }
-}
 
-#[async_trait]
-impl LakeHouse for Iceberg {
-    async fn store(
+    pub async fn store_transaction(
         &self,
         topic: &str,
-        partition: i32,
-        offset: i64,
-        inflated: &Batch,
-        config: DescribeConfigsResult,
+        writes: &[TransactionWrite<'_>],
     ) -> Result<()> {
-        let _ = config;
+        if writes.is_empty() {
+            return Ok(());
+        }
 
-        let record_batch = self
+        let first = writes[0];
+
+        let first_record_batch = self
             .schema_registry
-            .as_arrow(topic, partition, inflated, LakeHouseType::Iceberg)
+            .as_arrow(topic, first.partition, first.batch, LakeHouseType::Iceberg)
             .await?;
 
-        debug!(?record_batch);
+        debug!(?first_record_batch);
+        debug!(schema = ?first_record_batch.schema());
 
-        debug!(schema = ?record_batch.schema());
-
-        let schema = Schema::try_from(record_batch.schema().as_ref())
+        let schema = Schema::try_from(first_record_batch.schema().as_ref())
             .inspect(|schema| {
                 for field in schema.as_struct().fields() {
                     debug!(?field);
@@ -314,7 +318,11 @@ impl LakeHouse for Iceberg {
             DefaultLocationGenerator::new(table.metadata().clone())?,
             DefaultFileNameGenerator::new(
                 topic.to_owned(),
-                Some(format!("{partition:0>10}-{offset:0>20}")),
+                Some(format!(
+                    "txn-{partition:0>10}-{offset:0>20}",
+                    partition = first.partition,
+                    offset = first.offset
+                )),
                 DataFileFormat::Parquet,
             ),
         );
@@ -325,9 +333,21 @@ impl LakeHouse for Iceberg {
             .inspect_err(|err| error!(?err))?;
 
         data_file_writer
-            .write(record_batch)
+            .write(first_record_batch)
             .await
             .inspect_err(|err| debug!(?err))?;
+
+        for write in writes.iter().skip(1) {
+            let record_batch = self
+                .schema_registry
+                .as_arrow(topic, write.partition, write.batch, LakeHouseType::Iceberg)
+                .await?;
+
+            data_file_writer
+                .write(record_batch)
+                .await
+                .inspect_err(|err| debug!(?err))?;
+        }
 
         let data_files = data_file_writer
             .close()
@@ -352,6 +372,29 @@ impl LakeHouse for Iceberg {
             .inspect_err(|err| debug!(?err))
             .map_err(Into::into)
             .and(Ok(()))
+    }
+}
+
+#[async_trait]
+impl LakeHouse for Iceberg {
+    async fn store(&self, write: LakeWriteRequest<'_>) -> Result<()> {
+        let LakeWriteRequest {
+            topic,
+            partition,
+            offset,
+            inflated,
+            config,
+        } = write;
+
+        let _ = config;
+
+        let writes = [TransactionWrite {
+            partition,
+            offset,
+            batch: inflated,
+        }];
+
+        self.store_transaction(topic, &writes).await
     }
 
     async fn maintain(&self) -> Result<()> {
