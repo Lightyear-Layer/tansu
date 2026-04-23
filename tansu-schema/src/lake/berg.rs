@@ -209,8 +209,14 @@ async fn iceberg_catalog(catalog: &Url, warehouse: Option<String>) -> Result<Arc
         }
 
         ("memory", _) => {
+            let mut props = HashMap::new();
+            _ = props.insert(
+                REST_CATALOG_PROP_WAREHOUSE.to_string(),
+                warehouse.unwrap_or_else(|| String::from("memory://warehouse")),
+            );
+
             let catalog = MemoryCatalogBuilder::default()
-                .load("memory", HashMap::new())
+                .load("memory", props)
                 .await
                 .map_err(|e| Error::Iceberg(Box::new(e)))?;
             Ok(Arc::new(catalog) as Arc<dyn Catalog>)
