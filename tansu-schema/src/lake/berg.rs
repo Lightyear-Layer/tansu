@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env::vars,
     marker::PhantomData,
     sync::{Arc, Mutex},
@@ -21,7 +21,10 @@ use std::{
 
 use crate::{
     AsArrow as _, Error, Registry, Result,
-    lake::{LakeHouse, LakeHouseType, LakeWriteRequest},
+    lake::{
+        FinalizeTransactionRequest, LakeHouse, LakeHouseType, LakeWriteRequest,
+        StageTransactionalRequest,
+    },
 };
 use async_trait::async_trait;
 use iceberg::memory::MemoryCatalogBuilder;
@@ -126,7 +129,33 @@ pub struct Iceberg {
     catalog: Arc<dyn Catalog>,
     namespace: String,
     tables: Arc<Mutex<HashMap<String, Table>>>,
+    staged_writes: Arc<Mutex<BTreeMap<TxnKey, Vec<PendingWrite>>>>,
     schema_registry: Registry,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct TxnKey {
+    transaction_id: String,
+    producer_id: i64,
+    producer_epoch: i16,
+}
+
+impl TxnKey {
+    fn new(transaction_id: &str, producer_id: i64, producer_epoch: i16) -> Self {
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            producer_id,
+            producer_epoch,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingWrite {
+    topic: String,
+    partition: i32,
+    offset: i64,
+    batch: Batch,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -143,6 +172,7 @@ impl Iceberg {
             catalog,
             namespace: value.namespace.unwrap_or(String::from("tansu")),
             tables: Arc::new(Mutex::new(HashMap::new())),
+            staged_writes: Arc::new(Mutex::new(BTreeMap::new())),
             schema_registry: value.schema_registry,
         })
     }
@@ -403,6 +433,87 @@ impl LakeHouse for Iceberg {
 
     async fn lake_type(&self) -> Result<LakeHouseType> {
         Ok(LakeHouseType::Iceberg)
+    }
+
+    async fn stage_transactional(&self, request: StageTransactionalRequest<'_>) -> Result<()> {
+        let StageTransactionalRequest { transaction, write } = request;
+
+        let LakeWriteRequest {
+            topic,
+            partition,
+            offset,
+            inflated,
+            config: _config,
+        } = write;
+
+        let mut staged = self.staged_writes.lock().map_err(|err| {
+            Error::Message(format!("unable to lock iceberg staged writes: {err}"))
+        })?;
+
+        staged
+            .entry(TxnKey::new(
+                transaction.transaction_id,
+                transaction.producer_id,
+                transaction.producer_epoch,
+            ))
+            .or_default()
+            .push(PendingWrite {
+                topic: topic.to_owned(),
+                partition,
+                offset,
+                batch: inflated.clone(),
+            });
+
+        Ok(())
+    }
+
+    async fn finalize_transaction(&self, request: FinalizeTransactionRequest<'_>) -> Result<()> {
+        let key = TxnKey::new(
+            request.transaction.transaction_id,
+            request.transaction.producer_id,
+            request.transaction.producer_epoch,
+        );
+
+        let writes = self
+            .staged_writes
+            .lock()
+            .map_err(|err| Error::Message(format!("unable to lock iceberg staged writes: {err}")))?
+            .remove(&key);
+
+        if !request.committed {
+            return Ok(());
+        }
+
+        let Some(mut writes) = writes else {
+            return Ok(());
+        };
+
+        writes.sort_by(|lhs, rhs| {
+            lhs.topic
+                .cmp(&rhs.topic)
+                .then(lhs.partition.cmp(&rhs.partition))
+                .then(lhs.offset.cmp(&rhs.offset))
+        });
+
+        let mut by_topic: BTreeMap<String, Vec<TransactionWrite<'_>>> = BTreeMap::new();
+
+        for write in &writes {
+            by_topic
+                .entry(write.topic.clone())
+                .or_default()
+                .push(TransactionWrite {
+                    partition: write.partition,
+                    offset: write.offset,
+                    batch: &write.batch,
+                });
+        }
+
+        for (topic, transaction_writes) in by_topic {
+            self.store_transaction(topic.as_str(), &transaction_writes)
+                .await?;
+        }
+
+        Ok(())
     }
 }
 
