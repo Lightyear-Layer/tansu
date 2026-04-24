@@ -848,6 +848,14 @@ impl Postgres {
         2_i32.pow(bounded_attempt + 1).min(300)
     }
 
+    fn lake_outbox_completed_retention_seconds() -> i32 {
+        std::env::var("TANSU_LAKE_TXN_OUTBOX_COMPLETED_RETENTION_SECS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(7 * 24 * 60 * 60)
+    }
+
     async fn process_lake_txn_outbox_batch(&self, max_items: usize) -> Result<()> {
         let Some(ref lake) = self.lake else {
             return Ok(());
@@ -965,6 +973,17 @@ impl Postgres {
         );
 
         Ok(())
+    }
+
+    async fn cleanup_lake_txn_outbox_completed(&self, c: &Object) -> Result<u64> {
+        let retention_seconds = Self::lake_outbox_completed_retention_seconds();
+
+        self.prepare_execute(
+            c,
+            "lake_txn_outbox_cleanup_completed.sql",
+            &[&self.cluster, &retention_seconds],
+        )
+        .await
     }
 
     #[instrument(skip_all)]
@@ -3836,6 +3855,10 @@ impl Storage for Postgres {
 
         let compacted = self.policy_compact().await?;
         debug!(compacted);
+
+        let c = self.connection().await?;
+        let cleaned = self.cleanup_lake_txn_outbox_completed(&c).await?;
+        debug!(cleaned);
 
         _ = self
             .process_lake_txn_outbox_batch(64)

@@ -13,8 +13,9 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-select count(*)
-from lake_txn_outbox o
-join cluster c on c.id = o.cluster
-where c.name = $1
-    and o.status in ('pending', 'failed', 'in_progress');
+delete from lake_txn_outbox o
+using cluster c
+where c.id = o.cluster
+    and c.name = $1
+    and o.status = 'completed'
+    and o.completed_at < current_timestamp - make_interval(secs => $2);

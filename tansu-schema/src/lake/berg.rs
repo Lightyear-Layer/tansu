@@ -227,6 +227,22 @@ async fn iceberg_catalog(catalog: &Url, warehouse: Option<String>) -> Result<Arc
 }
 
 impl Iceberg {
+    fn max_staged_writes_per_transaction() -> usize {
+        std::env::var("TANSU_ICEBERG_MAX_STAGED_WRITES_PER_TRANSACTION")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1_024)
+    }
+
+    fn max_staged_writes_total() -> usize {
+        std::env::var("TANSU_ICEBERG_MAX_STAGED_WRITES_TOTAL")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(16_384)
+    }
+
     async fn create_namespace(&self) -> Result<NamespaceIdent> {
         let namespace_ident = NamespaceIdent::new(self.namespace.clone());
         debug!(%namespace_ident);
@@ -464,19 +480,38 @@ impl LakeHouse for Iceberg {
             Error::Message(format!("unable to lock iceberg staged writes: {err}"))
         })?;
 
-        staged
-            .entry(TxnKey::new(
+        let key = TxnKey::new(
+            transaction.transaction_id,
+            transaction.producer_id,
+            transaction.producer_epoch,
+        );
+
+        let total_staged = staged.values().map(std::vec::Vec::len).sum::<usize>();
+        if total_staged >= Self::max_staged_writes_total() {
+            return Err(Error::Message(format!(
+                "too many staged iceberg writes in memory: total={total_staged}, limit={}",
+                Self::max_staged_writes_total()
+            )));
+        }
+
+        let entry = staged.entry(key).or_default();
+        if entry.len() >= Self::max_staged_writes_per_transaction() {
+            return Err(Error::Message(format!(
+                "too many staged iceberg writes for transaction id={}, producer_id={}, producer_epoch={}: current={}, limit={}",
                 transaction.transaction_id,
                 transaction.producer_id,
                 transaction.producer_epoch,
-            ))
-            .or_default()
-            .push(PendingWrite {
-                topic: topic.to_owned(),
-                partition,
-                offset,
-                batch: inflated.clone(),
-            });
+                entry.len(),
+                Self::max_staged_writes_per_transaction()
+            )));
+        }
+
+        entry.push(PendingWrite {
+            topic: topic.to_owned(),
+            partition,
+            offset,
+            batch: inflated.clone(),
+        });
 
         Ok(())
     }
@@ -499,14 +534,21 @@ impl LakeHouse for Iceberg {
         }
 
         let Some(mut writes) = writes else {
+            let message = format!(
+                "missing staged iceberg writes for committed transaction; unable to finalize transaction_id={}, producer_id={}, producer_epoch={}",
+                request.transaction.transaction_id,
+                request.transaction.producer_id,
+                request.transaction.producer_epoch,
+            );
+
             warn!(
                 transaction_id = request.transaction.transaction_id,
                 producer_id = request.transaction.producer_id,
                 producer_epoch = request.transaction.producer_epoch,
-                "missing staged iceberg writes for committed transaction; treating as idempotent finalize"
+                "{message}"
             );
 
-            return Ok(());
+            return Err(Error::Message(message));
         };
 
         writes.sort_by(|lhs, rhs| {
@@ -516,22 +558,42 @@ impl LakeHouse for Iceberg {
                 .then(lhs.offset.cmp(&rhs.offset))
         });
 
-        let mut by_topic: BTreeMap<String, Vec<TransactionWrite<'_>>> = BTreeMap::new();
+        let mut by_topic: BTreeMap<String, Vec<usize>> = BTreeMap::new();
 
-        for write in &writes {
-            by_topic
-                .entry(write.topic.clone())
-                .or_default()
-                .push(TransactionWrite {
-                    partition: write.partition,
-                    offset: write.offset,
-                    batch: &write.batch,
-                });
+        for (index, write) in writes.iter().enumerate() {
+            by_topic.entry(write.topic.clone()).or_default().push(index);
         }
 
-        for (topic, transaction_writes) in by_topic {
-            self.store_transaction(topic.as_str(), &transaction_writes)
-                .await?;
+        for (topic, indices) in by_topic {
+            let transaction_writes = indices
+                .into_iter()
+                .map(|index| {
+                    let write = &writes[index];
+                    TransactionWrite {
+                        partition: write.partition,
+                        offset: write.offset,
+                        batch: &write.batch,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            if let Err(err) = self
+                .store_transaction(topic.as_str(), &transaction_writes)
+                .await
+            {
+                // Restore staged writes so retries can safely attempt finalization again.
+                self.staged_writes
+                    .lock()
+                    .map_err(|lock_err| {
+                        Error::Message(format!(
+                            "unable to restore staged iceberg writes after finalize failure: {lock_err}"
+                        ))
+                    })?
+                    .entry(key.clone())
+                    .or_insert(writes);
+
+                return Err(err);
+            }
         }
 
         Ok(())
@@ -595,18 +657,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_committed_missing_staged_writes_is_noop() -> Result<()> {
+    async fn finalize_committed_requires_staged_writes() -> Result<()> {
         let lake = memory_iceberg(alphanumeric_string(8)).await?;
 
-        lake.finalize_transaction(FinalizeTransactionRequest {
-            transaction: TransactionRef {
-                transaction_id: "txn-missing",
-                producer_id: 1,
-                producer_epoch: 0,
-            },
-            committed: true,
-        })
-        .await?;
+        let result = lake
+            .finalize_transaction(FinalizeTransactionRequest {
+                transaction: TransactionRef {
+                    transaction_id: "txn-missing",
+                    producer_id: 1,
+                    producer_epoch: 0,
+                },
+                committed: true,
+            })
+            .await;
+
+        assert!(result.is_err());
 
         Ok(())
     }

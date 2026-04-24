@@ -162,6 +162,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/lake_txn_outbox_pending_count.sql"),
         ),
         (
+            "lake_txn_outbox_cleanup_completed.sql",
+            include_sql!("sql/lake_txn_outbox_cleanup_completed.sql"),
+        ),
+        (
             "lite/policy_compact_compaction.sql",
             include_sql!("lite/policy_compact_compaction.sql"),
         ),
