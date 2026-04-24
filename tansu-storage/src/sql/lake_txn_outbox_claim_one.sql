@@ -10,23 +10,18 @@ with candidate as (
     from lake_txn_outbox o
     join cluster c on c.id = o.cluster
     where c.name = $1
-        and (
-            o.status in ('pending', 'failed')
-            or (
-                o.status = 'in_progress'
-                and o.last_updated < current_timestamp - interval '5 minutes'
-            )
-        )
+        and o.status in ('pending', 'failed', 'in_progress')
         and o.next_attempt_at <= current_timestamp
     order by o.created_at
-    for update skip locked
+    for update of o skip locked
     limit 1
 )
 update lake_txn_outbox o
 set
     status = 'in_progress',
     last_error = null,
-    last_updated = current_timestamp
+    last_updated = current_timestamp,
+    next_attempt_at = current_timestamp + make_interval(secs => $2)
 from candidate
 where o.id = candidate.id
 returning

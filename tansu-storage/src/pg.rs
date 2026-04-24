@@ -813,20 +813,34 @@ impl Postgres {
     }
 
     async fn claim_lake_outbox_item(&self, c: &Object) -> Result<Option<LakeTxnOutboxItem>> {
-        self.prepare_query_opt(c, "lake_txn_outbox_claim_one.sql", &[&self.cluster])
-            .await?
-            .map(|row| {
-                Ok(LakeTxnOutboxItem {
-                    id: row.try_get(0).inspect_err(|err| error!(?err))?,
-                    transaction_id: row.try_get(1).inspect_err(|err| error!(?err))?,
-                    producer_id: row.try_get(2).inspect_err(|err| error!(?err))?,
-                    producer_epoch: row.try_get(3).inspect_err(|err| error!(?err))?,
-                    committed: row.try_get(4).inspect_err(|err| error!(?err))?,
-                    created_at: row.try_get(5).inspect_err(|err| error!(?err))?,
-                    attempt_count: row.try_get(6).inspect_err(|err| error!(?err))?,
-                })
+        let lease_seconds = Self::lake_outbox_claim_lease_seconds();
+
+        self.prepare_query_opt(
+            c,
+            "lake_txn_outbox_claim_one.sql",
+            &[&self.cluster, &lease_seconds],
+        )
+        .await?
+        .map(|row| {
+            Ok(LakeTxnOutboxItem {
+                id: row.try_get(0).inspect_err(|err| error!(?err))?,
+                transaction_id: row.try_get(1).inspect_err(|err| error!(?err))?,
+                producer_id: row.try_get(2).inspect_err(|err| error!(?err))?,
+                producer_epoch: row.try_get(3).inspect_err(|err| error!(?err))?,
+                committed: row.try_get(4).inspect_err(|err| error!(?err))?,
+                created_at: row.try_get(5).inspect_err(|err| error!(?err))?,
+                attempt_count: row.try_get(6).inspect_err(|err| error!(?err))?,
             })
-            .transpose()
+        })
+        .transpose()
+    }
+
+    fn lake_outbox_claim_lease_seconds() -> i32 {
+        std::env::var("TANSU_LAKE_TXN_OUTBOX_CLAIM_LEASE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(300)
     }
 
     fn lake_outbox_retry_delay_seconds(attempt_count: i32) -> i32 {
@@ -3507,19 +3521,6 @@ impl Storage for Postgres {
                     Err(_) => ErrorCode::UnknownServerError,
                 };
 
-                if error == ErrorCode::None {
-                    _ = self
-                        .process_lake_txn_outbox_batch(16)
-                        .await
-                        .inspect_err(|err| {
-                            error!(
-                                ?err,
-                                cluster = self.cluster,
-                                "unable to process lake transaction outbox after init_producer"
-                            )
-                        });
-                }
-
                 Ok(ProducerIdResponse {
                     error,
                     id: producer,
@@ -3824,21 +3825,6 @@ impl Storage for Postgres {
             .await?;
 
         tx.commit().await?;
-
-        _ = self
-            .process_lake_txn_outbox_batch(16)
-            .await
-            .inspect_err(|err| {
-                error!(
-                    ?err,
-                    cluster = self.cluster,
-                    transaction_id,
-                    producer_id,
-                    producer_epoch,
-                    committed,
-                    "unable to process lake transaction outbox after txn_end"
-                )
-            });
 
         Ok(error_code)
     }

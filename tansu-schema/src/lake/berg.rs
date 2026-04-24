@@ -49,7 +49,7 @@ use iceberg_catalog_rest::{
 };
 use parquet::file::properties::WriterProperties;
 use tansu_sans_io::record::inflated::Batch;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -499,12 +499,14 @@ impl LakeHouse for Iceberg {
         }
 
         let Some(mut writes) = writes else {
-            return Err(Error::Message(format!(
-                "missing staged iceberg writes for committed transaction: id={}, producer_id={}, producer_epoch={}",
-                request.transaction.transaction_id,
-                request.transaction.producer_id,
-                request.transaction.producer_epoch
-            )));
+            warn!(
+                transaction_id = request.transaction.transaction_id,
+                producer_id = request.transaction.producer_id,
+                producer_epoch = request.transaction.producer_epoch,
+                "missing staged iceberg writes for committed transaction; treating as idempotent finalize"
+            );
+
+            return Ok(());
         };
 
         writes.sort_by(|lhs, rhs| {
@@ -593,21 +595,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_committed_requires_staged_writes() -> Result<()> {
+    async fn finalize_committed_missing_staged_writes_is_noop() -> Result<()> {
         let lake = memory_iceberg(alphanumeric_string(8)).await?;
 
-        let result = lake
-            .finalize_transaction(FinalizeTransactionRequest {
-                transaction: TransactionRef {
-                    transaction_id: "txn-missing",
-                    producer_id: 1,
-                    producer_epoch: 0,
-                },
-                committed: true,
-            })
-            .await;
-
-        assert!(result.is_err());
+        lake.finalize_transaction(FinalizeTransactionRequest {
+            transaction: TransactionRef {
+                transaction_id: "txn-missing",
+                producer_id: 1,
+                producer_epoch: 0,
+            },
+            committed: true,
+        })
+        .await?;
 
         Ok(())
     }
