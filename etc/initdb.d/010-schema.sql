@@ -493,6 +493,27 @@ order by
     p.id,
     pe.epoch;
 
+create table if not exists lake_txn_outbox (
+    id bigint generated always as identity primary key,
+    cluster int references cluster (id) on delete cascade not null,
+    transaction_id text not null,
+    producer_id bigint not null,
+    producer_epoch smallint not null,
+    committed bool not null,
+    -- pending, in_progress, failed, completed
+    status text not null,
+    attempt_count int default 0 not null,
+    next_attempt_at timestamp default current_timestamp not null,
+    last_error text,
+    completed_at timestamp,
+    unique (cluster, transaction_id, producer_id, producer_epoch),
+    last_updated timestamp default current_timestamp not null,
+    created_at timestamp default current_timestamp not null
+);
+
+create index if not exists idx_lake_txn_outbox_ready
+    on lake_txn_outbox (cluster, status, next_attempt_at, created_at);
+
 create
 or replace view v_watermark as
 with

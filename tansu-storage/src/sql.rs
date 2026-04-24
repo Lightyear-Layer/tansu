@@ -142,6 +142,30 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/list_latest_offset_uncommitted.sql"),
         ),
         (
+            "lake_txn_outbox_enqueue.sql",
+            include_sql!("sql/lake_txn_outbox_enqueue.sql"),
+        ),
+        (
+            "lake_txn_outbox_claim_one.sql",
+            include_sql!("sql/lake_txn_outbox_claim_one.sql"),
+        ),
+        (
+            "lake_txn_outbox_mark_completed.sql",
+            include_sql!("sql/lake_txn_outbox_mark_completed.sql"),
+        ),
+        (
+            "lake_txn_outbox_mark_failed.sql",
+            include_sql!("sql/lake_txn_outbox_mark_failed.sql"),
+        ),
+        (
+            "lake_txn_outbox_pending_count.sql",
+            include_sql!("sql/lake_txn_outbox_pending_count.sql"),
+        ),
+        (
+            "lake_txn_outbox_cleanup_completed.sql",
+            include_sql!("sql/lake_txn_outbox_cleanup_completed.sql"),
+        ),
+        (
             "lite/policy_compact_compaction.sql",
             include_sql!("lite/policy_compact_compaction.sql"),
         ),

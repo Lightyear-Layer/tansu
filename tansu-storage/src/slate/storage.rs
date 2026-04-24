@@ -48,7 +48,7 @@ use tansu_sans_io::{
     to_system_time,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
-use tansu_schema::lake::LakeHouse as _;
+use tansu_schema::lake::{LakeHouse as _, LakeWriteRequest};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -653,13 +653,13 @@ impl Storage for Engine {
                     .describe_config(topition.topic(), ConfigResource::Topic, None)
                     .await?;
 
-                lake.store(
-                    topition.topic(),
-                    topition.partition(),
+                lake.store(LakeWriteRequest {
+                    topic: topition.topic(),
+                    partition: topition.partition(),
                     offset,
-                    &inflated,
+                    inflated: &inflated,
                     config,
-                )
+                })
                 .await?;
             }
         }

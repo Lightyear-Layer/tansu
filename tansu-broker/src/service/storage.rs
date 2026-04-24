@@ -21,9 +21,9 @@ use tansu_sans_io::{
     ApiKey as _, ConsumerGroupDescribeRequest, CreateAclsRequest, CreateTopicsRequest,
     DeleteGroupsRequest, DeleteRecordsRequest, DeleteTopicsRequest, DescribeAclsRequest,
     DescribeClusterRequest, DescribeConfigsRequest, DescribeGroupsRequest,
-    DescribeTopicPartitionsRequest, DescribeUserScramCredentialsRequest, FetchRequest,
-    FindCoordinatorRequest, GetTelemetrySubscriptionsRequest, IncrementalAlterConfigsRequest,
-    InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
+    DescribeTopicPartitionsRequest, DescribeUserScramCredentialsRequest, EndTxnRequest,
+    FetchRequest, FindCoordinatorRequest, GetTelemetrySubscriptionsRequest,
+    IncrementalAlterConfigsRequest, InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
     ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
 use tansu_service::{FrameRequestLayer, FrameRouteBuilder};
@@ -35,7 +35,7 @@ use tansu_storage::{
     FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
     InitProducerIdService, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
-    TxnAddOffsetsService, TxnAddPartitionService, TxnOffsetCommitService,
+    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
 };
 
 use crate::Error;
@@ -63,6 +63,7 @@ where
         describe_groups,
         describe_topic_partitions,
         describe_user_scram_credentials,
+        end_txn,
         fetch,
         find_coordinator,
         get_telemetry_subscriptions,
@@ -622,6 +623,27 @@ where
                 FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
             )
                 .into_layer(TxnOffsetCommitService)
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
+pub fn end_txn<S>(
+    builder: FrameRouteBuilder<(), Error>,
+    storage: S,
+) -> Result<FrameRouteBuilder<(), Error>, Error>
+where
+    S: Storage + Clone,
+{
+    builder
+        .with_route(
+            EndTxnRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                MapStateLayer::new(|_| storage),
+                FrameRequestLayer::<EndTxnRequest>::new(),
+            )
+                .into_layer(TxnEndService)
                 .boxed(),
         )
         .map_err(Into::into)

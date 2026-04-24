@@ -58,7 +58,10 @@ use tansu_sans_io::{
 };
 use tansu_schema::{
     Registry,
-    lake::{House, LakeHouse as _},
+    lake::{
+        FinalizeTransactionRequest, House, LakeHouse as _, LakeWriteRequest,
+        StageTransactionalRequest, TransactionRef,
+    },
 };
 use tokio_postgres::{
     Config, Row, RowStream,
@@ -211,6 +214,19 @@ struct Txn {
     producer_id: i64,
     producer_epoch: i16,
     status: TxnState,
+}
+
+type FinalizedTxn = (String, i64, i16, bool);
+
+#[derive(Debug)]
+struct LakeTxnOutboxItem {
+    id: i64,
+    transaction_id: String,
+    producer_id: i64,
+    producer_epoch: i16,
+    committed: bool,
+    created_at: SystemTime,
+    attempt_count: i32,
 }
 
 impl TryFrom<Row> for Txn {
@@ -754,6 +770,222 @@ impl Postgres {
         tx.query_raw(&prepared, params).await.map_err(Into::into)
     }
 
+    async fn enqueue_lake_finalizations(
+        &self,
+        tx: &Transaction<'_>,
+        finalized_txns: &[FinalizedTxn],
+    ) -> Result<()> {
+        if self.lake.is_none() {
+            return Ok(());
+        }
+
+        if finalized_txns.is_empty() {
+            return Ok(());
+        }
+
+        for (transaction_id, producer_id, producer_epoch, committed) in finalized_txns {
+            _ = self
+                .tx_prepare_execute(
+                    tx,
+                    "lake_txn_outbox_enqueue.sql",
+                    &[
+                        &self.cluster,
+                        transaction_id,
+                        producer_id,
+                        producer_epoch,
+                        committed,
+                    ],
+                )
+                .await
+                .inspect_err(|err| {
+                    error!(
+                        ?err,
+                        cluster = self.cluster,
+                        transaction_id,
+                        producer_id,
+                        producer_epoch,
+                        committed
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
+    async fn claim_lake_outbox_item(&self, c: &Object) -> Result<Option<LakeTxnOutboxItem>> {
+        let lease_seconds = Self::lake_outbox_claim_lease_seconds();
+
+        self.prepare_query_opt(
+            c,
+            "lake_txn_outbox_claim_one.sql",
+            &[&self.cluster, &lease_seconds],
+        )
+        .await?
+        .map(|row| {
+            Ok(LakeTxnOutboxItem {
+                id: row.try_get(0).inspect_err(|err| error!(?err))?,
+                transaction_id: row.try_get(1).inspect_err(|err| error!(?err))?,
+                producer_id: row.try_get(2).inspect_err(|err| error!(?err))?,
+                producer_epoch: row.try_get(3).inspect_err(|err| error!(?err))?,
+                committed: row.try_get(4).inspect_err(|err| error!(?err))?,
+                created_at: row.try_get(5).inspect_err(|err| error!(?err))?,
+                attempt_count: row.try_get(6).inspect_err(|err| error!(?err))?,
+            })
+        })
+        .transpose()
+    }
+
+    fn lake_outbox_claim_lease_seconds() -> i32 {
+        std::env::var("TANSU_LAKE_TXN_OUTBOX_CLAIM_LEASE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(300)
+    }
+
+    fn lake_outbox_retry_delay_seconds(attempt_count: i32) -> i32 {
+        let bounded_attempt = attempt_count.clamp(0, 8) as u32;
+        2_i32.pow(bounded_attempt + 1).min(300)
+    }
+
+    fn lake_outbox_completed_retention_seconds() -> i32 {
+        std::env::var("TANSU_LAKE_TXN_OUTBOX_COMPLETED_RETENTION_SECS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(7 * 24 * 60 * 60)
+    }
+
+    async fn process_lake_txn_outbox_batch(&self, max_items: usize) -> Result<()> {
+        let Some(ref lake) = self.lake else {
+            return Ok(());
+        };
+
+        let c = self.connection().await?;
+
+        for _ in 0..max_items {
+            let Some(item) = self.claim_lake_outbox_item(&c).await? else {
+                break;
+            };
+
+            let lag_ms = SystemTime::now()
+                .duration_since(item.created_at)
+                .map_or(0, |duration| duration.as_millis() as u64);
+
+            let result = lake
+                .finalize_transaction(FinalizeTransactionRequest {
+                    transaction: TransactionRef {
+                        transaction_id: item.transaction_id.as_str(),
+                        producer_id: item.producer_id,
+                        producer_epoch: item.producer_epoch,
+                    },
+                    committed: item.committed,
+                })
+                .await;
+
+            match result {
+                Ok(()) => {
+                    _ = self
+                        .prepare_execute(&c, "lake_txn_outbox_mark_completed.sql", &[&item.id])
+                        .await
+                        .inspect_err(|err| {
+                            error!(
+                                ?err,
+                                cluster = self.cluster,
+                                outbox_id = item.id,
+                                transaction_id = item.transaction_id,
+                                producer_id = item.producer_id,
+                                producer_epoch = item.producer_epoch,
+                            )
+                        })?;
+
+                    LAKE_TXN_OUTBOX_LAG_MS
+                        .record(lag_ms, &[KeyValue::new("cluster_id", self.cluster.clone())]);
+
+                    LAKE_TXN_OUTBOX_PROCESSED.add(
+                        1,
+                        &[
+                            KeyValue::new("cluster_id", self.cluster.clone()),
+                            KeyValue::new("result", "success"),
+                        ],
+                    );
+                }
+
+                Err(err) => {
+                    let retry_seconds = Self::lake_outbox_retry_delay_seconds(item.attempt_count);
+                    let err_text = err.to_string();
+
+                    _ = self
+                        .prepare_execute(
+                            &c,
+                            "lake_txn_outbox_mark_failed.sql",
+                            &[&item.id, &retry_seconds, &err_text],
+                        )
+                        .await
+                        .inspect_err(|update_err| {
+                            error!(
+                                ?update_err,
+                                cluster = self.cluster,
+                                outbox_id = item.id,
+                                transaction_id = item.transaction_id,
+                                producer_id = item.producer_id,
+                                producer_epoch = item.producer_epoch,
+                            )
+                        })?;
+
+                    LAKE_TXN_OUTBOX_FAILURES.add(
+                        1,
+                        &[
+                            KeyValue::new("cluster_id", self.cluster.clone()),
+                            KeyValue::new("result", "failure"),
+                        ],
+                    );
+
+                    error!(
+                        cluster = self.cluster,
+                        outbox_id = item.id,
+                        transaction_id = item.transaction_id,
+                        producer_id = item.producer_id,
+                        producer_epoch = item.producer_epoch,
+                        retry_seconds,
+                        err = ?err
+                    );
+                }
+            }
+        }
+
+        self.observe_lake_txn_outbox_depth(&c).await
+    }
+
+    async fn observe_lake_txn_outbox_depth(&self, c: &Object) -> Result<()> {
+        let Some(row) = self
+            .prepare_query_opt(c, "lake_txn_outbox_pending_count.sql", &[&self.cluster])
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let depth: i64 = row.try_get(0)?;
+
+        LAKE_TXN_OUTBOX_DEPTH.record(
+            u64::try_from(depth.max(0)).unwrap_or_default(),
+            &[KeyValue::new("cluster_id", self.cluster.clone())],
+        );
+
+        Ok(())
+    }
+
+    async fn cleanup_lake_txn_outbox_completed(&self, c: &Object) -> Result<u64> {
+        let retention_seconds = Self::lake_outbox_completed_retention_seconds();
+
+        self.prepare_execute(
+            c,
+            "lake_txn_outbox_cleanup_completed.sql",
+            &[&self.cluster, &retention_seconds],
+        )
+        .await
+    }
+
     #[instrument(skip_all)]
     async fn produce_in_tx(
         &self,
@@ -982,8 +1214,35 @@ impl Postgres {
             .inspect(|n| debug!(?n))
             .inspect_err(|err| error!(?err))?;
 
-        self.lake_store(&attributes, topition, high, &inflated)
-            .await?;
+        if let Some(transaction_id) = transaction_id
+            && attributes.transaction
+            && !attributes.control
+        {
+            if let Some(ref lake) = self.lake {
+                let config = self
+                    .describe_config(topic, ConfigResource::Topic, None)
+                    .await?;
+
+                lake.stage_transactional(StageTransactionalRequest {
+                    transaction: TransactionRef {
+                        transaction_id,
+                        producer_id: inflated.producer_id,
+                        producer_epoch: inflated.producer_epoch,
+                    },
+                    write: LakeWriteRequest {
+                        topic,
+                        partition,
+                        offset: high.unwrap_or_default(),
+                        inflated: &inflated,
+                        config,
+                    },
+                })
+                .await?;
+            }
+        } else {
+            self.lake_store(&attributes, topition, high, &inflated)
+                .await?;
+        }
 
         Ok(high.unwrap_or_default())
     }
@@ -996,10 +1255,11 @@ impl Postgres {
         producer_epoch: i16,
         committed: bool,
         tx: &Transaction<'_>,
-    ) -> Result<ErrorCode> {
+    ) -> Result<(ErrorCode, Vec<FinalizedTxn>)> {
         debug!(cluster = ?self.cluster, ?transaction_id, ?producer_id, ?producer_epoch, ?committed);
 
         let mut overlaps = vec![];
+        let mut finalized_txns = vec![];
 
         let rows = self
             .tx_prepare_query(
@@ -1118,6 +1378,7 @@ impl Postgres {
 
             for txn in txns {
                 debug!(?txn);
+                let committed = txn.status == TxnState::PrepareCommit;
 
                 _ = self
                     .tx_prepare_execute(
@@ -1207,6 +1468,8 @@ impl Postgres {
                         ],
                     )
                     .await?;
+
+                finalized_txns.push((txn.name, txn.producer_id, txn.producer_epoch, committed));
             }
         } else {
             debug!(?overlaps);
@@ -1238,7 +1501,7 @@ impl Postgres {
                 })?;
         }
 
-        Ok(ErrorCode::None)
+        Ok((ErrorCode::None, finalized_txns))
     }
 
     #[instrument(skip_all)]
@@ -1256,13 +1519,13 @@ impl Postgres {
                 .describe_config(topition.topic(), ConfigResource::Topic, None)
                 .await?;
 
-            lake.store(
-                topition.topic(),
-                topition.partition(),
-                high.unwrap_or_default(),
+            lake.store(LakeWriteRequest {
+                topic: topition.topic(),
+                partition: topition.partition(),
+                offset: high.unwrap_or_default(),
                 inflated,
                 config,
-            )
+            })
             .await?;
         }
 
@@ -3135,6 +3398,7 @@ impl Storage for Postgres {
             if let Some(transaction_id) = transaction_id {
                 let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
                 let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+                let mut finalized_txns = vec![];
 
                 if let Some(row) = self
                     .tx_prepare_query_opt(
@@ -3157,9 +3421,10 @@ impl Storage for Postgres {
                     debug!(transaction_id, id, epoch, ?status);
 
                     if let Some(TxnState::Begin) = status {
-                        let error = self
+                        let (error, txns) = self
                             .end_in_tx(transaction_id, id, epoch, false, &tx)
                             .await?;
+                        finalized_txns.extend(txns);
 
                         if error != ErrorCode::None {
                             _ = tx
@@ -3258,6 +3523,9 @@ impl Storage for Postgres {
                         ?err
                     ))?
                 );
+
+                self.enqueue_lake_finalizations(&tx, &finalized_txns)
+                    .await?;
 
                 let error = match tx.commit().await.inspect_err(|err| {
                     error!(
@@ -3568,8 +3836,11 @@ impl Storage for Postgres {
         let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
         let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
-        let error_code = self
+        let (error_code, finalized_txns) = self
             .end_in_tx(transaction_id, producer_id, producer_epoch, committed, &tx)
+            .await?;
+
+        self.enqueue_lake_finalizations(&tx, &finalized_txns)
             .await?;
 
         tx.commit().await?;
@@ -3584,6 +3855,21 @@ impl Storage for Postgres {
 
         let compacted = self.policy_compact().await?;
         debug!(compacted);
+
+        let c = self.connection().await?;
+        let cleaned = self.cleanup_lake_txn_outbox_completed(&c).await?;
+        debug!(cleaned);
+
+        _ = self
+            .process_lake_txn_outbox_batch(64)
+            .await
+            .inspect_err(|err| {
+                error!(
+                    ?err,
+                    cluster = self.cluster,
+                    "unable to process lake transaction outbox during maintain"
+                )
+            });
 
         if let Some(ref lake) = self.lake {
             return lake.maintain().await.map_err(Into::into);
@@ -3707,5 +3993,34 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_sql_error")
         .with_description("The SQL error count")
+        .build()
+});
+
+static LAKE_TXN_OUTBOX_LAG_MS: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("tansu_lake_txn_outbox_lag_ms")
+        .with_unit("ms")
+        .with_description("Lag from transaction finalization enqueue until lake finalization")
+        .build()
+});
+
+static LAKE_TXN_OUTBOX_DEPTH: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("tansu_lake_txn_outbox_depth")
+        .with_description("Pending lake transaction outbox queue depth")
+        .build()
+});
+
+static LAKE_TXN_OUTBOX_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_lake_txn_outbox_failures")
+        .with_description("Lake transaction outbox finalization failures")
+        .build()
+});
+
+static LAKE_TXN_OUTBOX_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_lake_txn_outbox_processed")
+        .with_description("Lake transaction outbox finalization attempts by result")
         .build()
 });

@@ -45,11 +45,11 @@ use opentelemetry::{
     metrics::{Counter, Histogram},
 };
 use parquet::file::properties::WriterProperties;
-use tansu_sans_io::{describe_configs_response::DescribeConfigsResult, record::inflated::Batch};
+use tansu_sans_io::describe_configs_response::DescribeConfigsResult;
 use tracing::{debug, instrument, warn};
 use url::Url;
 
-use super::{House, LakeHouse};
+use super::{House, LakeHouse, LakeWriteRequest};
 
 #[derive(Clone, Debug, Default)]
 pub struct Builder<L = PhantomData<Url>, R = PhantomData<Registry>> {
@@ -669,15 +669,16 @@ impl Delta {
 
 #[async_trait]
 impl LakeHouse for Delta {
-    #[instrument(skip(self, inflated, config), ret)]
-    async fn store(
-        &self,
-        topic: &str,
-        partition: i32,
-        offset: i64,
-        inflated: &Batch,
-        config: DescribeConfigsResult,
-    ) -> Result<()> {
+    #[instrument(skip(self, write), ret)]
+    async fn store(&self, write: LakeWriteRequest<'_>) -> Result<()> {
+        let LakeWriteRequest {
+            topic,
+            partition,
+            offset,
+            inflated,
+            config,
+        } = write;
+
         let config = Config::from(config);
         debug!(?config);
 
@@ -978,7 +979,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -1071,7 +1078,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -1175,7 +1188,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -1289,7 +1308,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -1403,7 +1428,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -1507,7 +1538,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -1621,7 +1658,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -1728,7 +1771,7 @@ mod tests {
 
             assert!(matches!(
                 lake_house
-                    .store(topic, partition, offset, &record_batch, config)
+                    .store(LakeWriteRequest { topic, partition, offset, inflated: &record_batch, config })
                     .await
                     .inspect(|result| debug!(?result))
                     .inspect_err(|err| debug!(?err)),
@@ -1845,7 +1888,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -1940,7 +1989,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -2033,7 +2088,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch_001, config.clone())
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch_001,
+                    config: config.clone(),
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -2099,7 +2160,13 @@ mod tests {
             let offset = 654323456;
 
             lake_house
-                .store(topic, partition, offset, &record_batch_002, config.clone())
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch_002,
+                    config: config.clone(),
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -2166,7 +2233,13 @@ mod tests {
             let offset = 765434567;
 
             lake_house
-                .store(topic, partition, offset, &record_batch_003, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch_003,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -2317,7 +2390,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;
@@ -2443,7 +2522,13 @@ mod tests {
             let offset = 543212345;
 
             lake_house
-                .store(topic, partition, offset, &record_batch, config)
+                .store(LakeWriteRequest {
+                    topic,
+                    partition,
+                    offset,
+                    inflated: &record_batch,
+                    config,
+                })
                 .await
                 .inspect(|result| debug!(?result))
                 .inspect_err(|err| debug!(?err))?;

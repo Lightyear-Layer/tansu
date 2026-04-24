@@ -1,0 +1,49 @@
+-- -*- mode: sql; sql-product: postgres; -*-
+-- Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+-- http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+
+with candidate as (
+    select
+        o.id,
+        o.transaction_id,
+        o.producer_id,
+        o.producer_epoch,
+        o.committed,
+        o.created_at,
+        o.attempt_count
+    from lake_txn_outbox o
+    join cluster c on c.id = o.cluster
+    where c.name = $1
+        and o.status in ('pending', 'failed', 'in_progress')
+        and o.next_attempt_at <= current_timestamp
+    order by o.created_at
+    for update of o skip locked
+    limit 1
+)
+update lake_txn_outbox o
+set
+    status = 'in_progress',
+    last_error = null,
+    last_updated = current_timestamp,
+    next_attempt_at = current_timestamp + make_interval(secs => $2)
+from candidate
+where o.id = candidate.id
+returning
+    candidate.id,
+    candidate.transaction_id,
+    candidate.producer_id,
+    candidate.producer_epoch,
+    candidate.committed,
+    candidate.created_at,
+    candidate.attempt_count;
